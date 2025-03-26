@@ -71,6 +71,11 @@ def get_params_grad(model):
         grads.append(0. if param.grad is None else param.grad + 0.)
     return params, grads
 
+def get_params_grad_autograd(model, loss):
+    params = [p for p in model.parameters() if p.requires_grad]
+    assert all([p.grad == None for p in params])
+    gradsH = torch.autograd.grad(loss, params, create_graph=True, retain_graph=True, only_inputs=True)
+    return params, gradsH
 
 def hessian_vector_product(gradsH, params, v):
     """

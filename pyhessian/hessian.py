@@ -18,13 +18,20 @@
 # along with PyHessian.  If not, see <http://www.gnu.org/licenses/>.
 #*
 
+import gc
 import torch
 import math
 from torch.autograd import Variable
 import numpy as np
+from tqdm import tqdm
 
-from pyhessian.utils import group_product, group_add, normalization, get_params_grad, hessian_vector_product, orthnormal
+from pyhessian.utils import group_product, group_add, normalization, get_params_grad, hessian_vector_product, orthnormal, get_params_grad_autograd
 
+def print_cudamem(step=""):
+    torch.cuda.synchronize()
+    print(f"{step}: Allocated: {torch.cuda.memory_allocated()/1e9:.3f} GB, "
+          f"Max allocated: {torch.cuda.max_memory_allocated()/1e9:.3f} GB, "
+          f"Cached: {torch.cuda.memory_reserved()/1e9:.3f} GB")
 
 class hessian():
     """
@@ -46,7 +53,8 @@ class hessian():
         assert (data != None and dataloader == None) or (data == None and
                                                          dataloader != None)
 
-        self.model = model.eval()  # make model is in evaluation model
+        # self.model = model.eval()  # make model is in evaluation model
+        self.model = model
         self.criterion = criterion
 
         if data != None:
@@ -63,14 +71,10 @@ class hessian():
 
         # pre-processing for single batch case to simplify the computation.
         if not self.full_dataset:
-            self.inputs, self.targets = self.data
-            if self.device == 'cuda':
-                self.inputs, self.targets = self.inputs.cuda(
-                ), self.targets.cuda()
-
             # if we only compute the Hessian information for a single batch data, we can re-use the gradients.
-            outputs = self.model(self.inputs)
-            loss = self.criterion(outputs, self.targets)
+            outputs = model(self.data, training=True, compute_force=True)
+            #loss = self.criterion(outputs, self.targets)
+            loss = self.criterion(pred=outputs, ref=self.data)
             loss.backward(create_graph=True)
 
         # this step is used to extract the parameters from the model
@@ -79,20 +83,20 @@ class hessian():
         self.gradsH = gradsH  # gradient used for Hessian computation
 
     def dataloader_hv_product(self, v):
-
         device = self.device
         num_data = 0  # count the number of datum points in the dataloader
 
         THv = [torch.zeros(p.size()).to(device) for p in self.params
               ]  # accumulate result
-        for inputs, targets in self.data:
+        for inputs in self.data:
+            self.model = self.model.train()
             self.model.zero_grad()
-            tmp_num_data = inputs.size(0)
-            outputs = self.model(inputs.to(device))
-            loss = self.criterion(outputs, targets.to(device))
-            loss.backward(create_graph=True)
-            params, gradsH = get_params_grad(self.model)
-            self.model.zero_grad()
+            tmp_num_data = len(inputs)#.size(0)
+            outputs = self.model(inputs.to(device), training=True, compute_force=True)
+            #print_cudamem("After forward pass")
+            loss = self.criterion(pred=outputs, ref=inputs.to(device))
+            # loss.backward(create_graph=True)
+            params, gradsH = get_params_grad_autograd(self.model, loss)
             Hv = torch.autograd.grad(gradsH,
                                      params,
                                      grad_outputs=v,
@@ -104,8 +108,31 @@ class hessian():
             ]
             num_data += float(tmp_num_data)
 
+            # 🚀 Delete unused tensors and clear memory
+            print_cudamem("Before clean up")
+            self.model.zero_grad(set_to_none=True)
+            for p in params:
+                p.grad = None
+            for g in gradsH:
+                g.grad = None
+            for vi in v:
+                vi.grad = None
+            for tensor in [gradsH, Hv, params, loss, outputs, inputs]:
+                if isinstance(tensor, list):
+                    for t in tensor:
+                        del t
+                del tensor
+            self.model = self.model.eval()
+            gc.collect()
+            torch.cuda.empty_cache()
+            print_cudamem("After batch cleanup")
+
+        # 🚀 Normalize THv
         THv = [THv1 / float(num_data) for THv1 in THv]
+
+        # 🚀 Compute eigenvalue
         eigenvalue = group_product(THv, v).cpu().item()
+
         return eigenvalue, THv
 
     def eigenvalues(self, maxIter=100, tol=1e-3, top_n=1):
@@ -132,6 +159,7 @@ class hessian():
             v = normalization(v)  # normalize the vector
 
             for i in range(maxIter):
+                print(f"Running {i} th iteration")
                 v = orthnormal(v, eigenvectors)
                 self.model.zero_grad()
 
