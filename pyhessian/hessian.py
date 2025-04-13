@@ -68,7 +68,7 @@ class hessian():
             self.device = 'cuda'
         else:
             self.device = 'cpu'
-
+        print("inside init, self.device: ", self.device)
         # pre-processing for single batch case to simplify the computation.
         if not self.full_dataset:
             # if we only compute the Hessian information for a single batch data, we can re-use the gradients.
@@ -88,15 +88,22 @@ class hessian():
 
         THv = [torch.zeros(p.size()).to(device) for p in self.params
               ]  # accumulate result
-        for inputs in self.data:
+        for (inputs, target) in self.data:
             self.model = self.model.train()
             self.model.zero_grad()
             tmp_num_data = len(inputs)#.size(0)
-            outputs = self.model(inputs.to(device), training=True, compute_force=True)
-            #print_cudamem("After forward pass")
-            loss = self.criterion(pred=outputs, ref=inputs.to(device))
+            print("inputs.device:", inputs.device)
+            try:    
+                outputs = self.model(inputs.to(device), training=True, compute_force=True)
+                #print_cudamem("After forward pass")
+                loss = self.criterion(pred=outputs, ref=inputs.to(device))
+            except:
+                outputs = self.model(inputs.to(device))
+                print("outputs.device: ", outputs.device)
+                loss = self.criterion(outputs, target.to(device))
             # loss.backward(create_graph=True)
             params, gradsH = get_params_grad_autograd(self.model, loss)
+            print("DOne compute mdodel.forward")
             Hv = torch.autograd.grad(gradsH,
                                      params,
                                      grad_outputs=v,
@@ -109,7 +116,8 @@ class hessian():
             num_data += float(tmp_num_data)
 
             # 🚀 Delete unused tensors and clear memory
-            print_cudamem("Before clean up")
+            if device == "cuda":
+                print_cudamem("Before clean up")
             self.model.zero_grad(set_to_none=True)
             for p in params:
                 p.grad = None
@@ -124,8 +132,10 @@ class hessian():
                 del tensor
             self.model = self.model.eval()
             gc.collect()
-            torch.cuda.empty_cache()
-            print_cudamem("After batch cleanup")
+            if device == "cuda":
+                print_cudamem("Before clean up")
+                torch.cuda.empty_cache()
+                print_cudamem("After batch cleanup")
 
         # 🚀 Normalize THv
         THv = [THv1 / float(num_data) for THv1 in THv]
